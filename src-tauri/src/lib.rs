@@ -1,11 +1,15 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 use serde::Serialize;
 use std::env;
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
+use std::time::{Duration, Instant};
 
 static VOICE_LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static VOICE_CHILD: Mutex<Option<Child>> = Mutex::new(None);
@@ -64,7 +68,7 @@ fn push_voice_log(line: String) {
 
 fn run_powershell(command: &str) -> Result<std::process::Output, String> {
     #[cfg(target_os = "windows")]
-    let mut cmd = Command::new("powershell");
+    let mut cmd = Command::new(powershell_executable());
 
     #[cfg(not(target_os = "windows"))]
     let mut cmd = Command::new("powershell.exe");
@@ -76,6 +80,160 @@ fn run_powershell(command: &str) -> Result<std::process::Output, String> {
         .arg(command)
         .output()
         .map_err(|e| format!("powershell exec failed: {e}"))
+}
+
+fn api_status_ok(timeout_ms: u64) -> bool {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build();
+
+    let Ok(client) = client else {
+        return false;
+    };
+
+    match client.get("http://127.0.0.1:8000/status").send() {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+fn wait_for_api_up(timeout: Duration) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if api_status_ok(800) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    false
+}
+
+fn mk1_root_dir() -> String {
+    env::var("MK1_ROOT").unwrap_or_else(|_| "E:\\Mina_MK1".to_string())
+}
+
+fn mk1_script_path(script_name: &str) -> String {
+    Path::new(&mk1_root_dir())
+        .join(script_name)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn powershell_executable() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        let system_root = env::var("SystemRoot")
+            .or_else(|_| env::var("WINDIR"))
+            .unwrap_or_else(|_| "C:\\Windows".to_string());
+        let candidate = Path::new(&system_root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        if candidate.exists() {
+            return candidate.to_string_lossy().to_string();
+        }
+        return "powershell.exe".to_string();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        "powershell.exe".to_string()
+    }
+}
+
+fn spawn_detached_powershell_file(script_path: &str, cwd: &str) -> Result<u32, String> {
+    #[cfg(target_os = "windows")]
+    let cmd = Command::new(powershell_executable());
+
+    #[cfg(not(target_os = "windows"))]
+    let mut cmd = Command::new("powershell.exe");
+
+    let mut configured = cmd;
+    configured
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-File")
+        .arg(script_path)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    {
+        configured.creation_flags(0x00000008 | 0x00000200);
+    }
+
+    let child = configured
+        .spawn()
+        .map_err(|e| format!("failed to launch script: {e}"))?;
+    Ok(child.id())
+}
+
+fn spawn_visible_powershell_file(script_path: &str, cwd: &str) -> Result<u32, String> {
+    #[cfg(target_os = "windows")]
+    let cmd = Command::new(powershell_executable());
+
+    #[cfg(not(target_os = "windows"))]
+    let mut cmd = Command::new("powershell.exe");
+
+    let script_path_owned = script_path.to_string();
+    let cwd_owned = cwd.to_string();
+
+    let mut configured = cmd;
+    configured
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-NoExit")
+        .arg("-Command")
+        .arg(format!(
+            "Set-Location -LiteralPath '{}' ; & '{}'",
+            cwd_owned.replace("'", "''"),
+            script_path_owned.replace("'", "''")
+        ))
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let child = configured
+        .spawn()
+        .map_err(|e| format!("failed to launch visible script: {e}"))?;
+    Ok(child.id())
+}
+
+fn read_pid_from_file(path: &Path) -> Option<u32> {
+    let raw = fs::read_to_string(path).ok()?;
+    raw.trim().parse::<u32>().ok()
+}
+
+fn is_pid_running(pid: u32) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let probe = format!(
+            "$p = Get-Process -Id {} -ErrorAction SilentlyContinue; if ($p) {{ 'RUNNING' }} else {{ 'STOPPED' }}",
+            pid
+        );
+        if let Ok(out) = run_powershell(&probe) {
+            if out.status.success() {
+                let txt = String::from_utf8_lossy(&out.stdout).to_string();
+                return txt.to_ascii_uppercase().contains("RUNNING");
+            }
+        }
+        false
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let output = Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .output();
+        output.map(|o| o.status.success()).unwrap_or(false)
+    }
 }
 
 fn get_tracked_pid() -> Option<u32> {
@@ -105,6 +263,51 @@ fn find_windows_voice_pid() -> Result<Option<u32>, String> {
     Ok(pid)
 }
 
+fn find_voice_monitor_pid() -> Result<Option<u32>, String> {
+    let probe = r#"
+$matches = Get-CimInstance Win32_Process |
+    Where-Object {
+        $_.CommandLine -and (
+            $_.CommandLine -like '*start_mina_voice_monitor.ps1*' -or
+            $_.CommandLine -like '*mina_windows_voice_loop.py*'
+        )
+    } |
+    Select-Object -First 1 -ExpandProperty ProcessId
+$matches
+"#;
+
+    let out = run_powershell(probe)?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+
+    let raw = String::from_utf8_lossy(&out.stdout).to_string();
+    let pid = raw
+        .lines()
+        .find_map(|line| line.trim().parse::<u32>().ok());
+    Ok(pid)
+}
+
+fn wait_for_voice_monitor_running(timeout: Duration) -> Result<Option<u32>, String> {
+    let started = Instant::now();
+    let pid_file = Path::new(&mk1_root_dir()).join(".mk1_voice_monitor.pid");
+
+    while started.elapsed() < timeout {
+        let status = voice_status()?;
+        if status.running {
+            if let Some(pid) = get_tracked_pid() {
+                return Ok(Some(pid));
+            }
+            if let Some(pid) = read_pid_from_file(&pid_file) {
+                return Ok(Some(pid));
+            }
+        }
+        thread::sleep(Duration::from_millis(400));
+    }
+
+    Ok(None)
+}
+
 fn ensure_voice_helper() -> Result<(), String> {
     let mut guard = VOICE_CHILD.lock().map_err(|_| "voice child mutex poisoned")?;
 
@@ -122,7 +325,7 @@ fn ensure_voice_helper() -> Result<(), String> {
         script = script_path,
     );
     #[cfg(target_os = "windows")]
-    let mut proc = Command::new("powershell");
+    let mut proc = Command::new(powershell_executable());
     #[cfg(not(target_os = "windows"))]
     let mut proc = Command::new("powershell.exe");
 
@@ -512,8 +715,27 @@ fn voice_status() -> Result<VoiceStatus, String> {
             }
         }
     } else {
-        set_tracked_pid(None);
-        None
+        let pid_file = Path::new(&mk1_root_dir()).join(".mk1_voice_monitor.pid");
+        let mut discovered = None;
+
+        if let Some(pid) = read_pid_from_file(&pid_file) {
+            if is_pid_running(pid) {
+                discovered = Some(pid);
+            }
+        }
+
+        if discovered.is_none() {
+            discovered = find_voice_monitor_pid()?;
+            if let Some(pid) = discovered {
+                let _ = fs::write(&pid_file, pid.to_string());
+            } else {
+                let _ = fs::remove_file(&pid_file);
+            }
+        }
+
+        set_tracked_pid(discovered);
+        running = discovered.is_some();
+        discovered
     };
 
     Ok(VoiceStatus {
@@ -534,6 +756,198 @@ fn voice_feed() -> Result<VoiceFeed, String> {
     Ok(VoiceFeed { lines: log.clone() })
 }
 
+#[tauri::command]
+fn service_start_api_local() -> Result<serde_json::Value, String> {
+    let script = mk1_script_path("start_mk1_api.ps1");
+    if !Path::new(&script).exists() {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": "start_script_missing",
+            "path": script,
+        }));
+    }
+
+    let cwd = mk1_root_dir();
+
+    // Run startup script directly so we can return real stdout/stderr if it fails.
+    let ps = format!(
+        "Set-Location -LiteralPath '{}' ; & '{}'",
+        ps_single_quote(&cwd),
+        ps_single_quote(&script)
+    );
+
+    let out = run_powershell(&ps)?;
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    if !out.status.success() {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": "start_script_failed",
+            "script": script,
+            "stdout": stdout,
+            "stderr": stderr,
+            "exit_code": out.status.code(),
+        }));
+    }
+
+    let healthy = wait_for_api_up(Duration::from_secs(8));
+    if !healthy {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": "api_not_reachable_after_start",
+            "script": script,
+            "stdout": stdout,
+            "stderr": stderr,
+            "exit_code": out.status.code(),
+        }));
+    }
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "script": script,
+        "stdout": stdout,
+        "stderr": stderr,
+        "exit_code": out.status.code(),
+        "verified": true,
+    }))
+}
+
+#[tauri::command]
+fn service_stop_api_local() -> Result<serde_json::Value, String> {
+    let script = mk1_script_path("stop_mk1_api.ps1");
+    if !Path::new(&script).exists() {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": "stop_script_missing",
+            "path": script,
+        }));
+    }
+
+    let cwd = mk1_root_dir();
+    let ps = format!(
+        "Set-Location -LiteralPath '{}' ; & '{}'",
+        ps_single_quote(&cwd),
+        ps_single_quote(&script)
+    );
+
+    let out = run_powershell(&ps)?;
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    Ok(serde_json::json!({
+        "ok": out.status.success(),
+        "script": script,
+        "stdout": stdout,
+        "stderr": stderr,
+        "exit_code": out.status.code(),
+    }))
+}
+
+#[tauri::command]
+fn service_start_voice_loop_local() -> Result<serde_json::Value, String> {
+    let script = mk1_script_path("start_mina_voice_monitor.ps1");
+    if !Path::new(&script).exists() {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": "voice_start_script_missing",
+            "path": script,
+        }));
+    }
+
+    let cwd = mk1_root_dir();
+    let pid = spawn_visible_powershell_file(&script, &cwd)?;
+    let verified_pid = wait_for_voice_monitor_running(Duration::from_secs(12))?;
+
+    if verified_pid.is_none() {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": "voice_monitor_failed_to_start",
+            "launch_pid": pid,
+            "script": script,
+            "detail": "voice monitor did not report a live process before timeout",
+        }));
+    }
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "pid": pid,
+        "monitor_pid": verified_pid,
+        "script": script,
+        "verified": true,
+    }))
+}
+
+#[tauri::command]
+fn service_stop_voice_loop_local() -> Result<serde_json::Value, String> {
+        let root = mk1_root_dir();
+        let pid_file = Path::new(&root).join(".mk1_voice_monitor.pid");
+
+        let mut stopped_pid: Option<u32> = None;
+        if let Some(pid) = read_pid_from_file(&pid_file) {
+                if is_pid_running(pid) {
+                        let kill_cmd = format!("Stop-Process -Id {} -Force -ErrorAction SilentlyContinue", pid);
+                        let _ = run_powershell(&kill_cmd);
+                        stopped_pid = Some(pid);
+                }
+        }
+
+        // Fallback: kill known monitor/loop processes by command line.
+        let sweep = r#"
+Get-CimInstance Win32_Process |
+    Where-Object {
+        $_.CommandLine -and (
+            $_.CommandLine -like '*start_mina_voice_monitor.ps1*' -or
+            $_.CommandLine -like '*mina_windows_voice_loop.py*'
+        )
+    } |
+    ForEach-Object {
+        try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
+    }
+"#;
+        let _ = run_powershell(sweep);
+
+        let _ = fs::remove_file(&pid_file);
+        let _ = fs::remove_file(Path::new(&env::temp_dir()).join("mina_voice_monitor.mute"));
+
+        set_capture_active(false);
+        set_tracked_pid(None);
+
+        Ok(serde_json::json!({
+                "ok": true,
+                "stopped_pid": stopped_pid,
+                "pid_file": pid_file.to_string_lossy().to_string(),
+        }))
+}
+
+#[tauri::command]
+fn service_voice_loop_status() -> Result<VoiceStatus, String> {
+    let pid_file = Path::new(&mk1_root_dir()).join(".mk1_voice_monitor.pid");
+    if !pid_file.exists() {
+        return Ok(VoiceStatus {
+            running: false,
+            detail: "voice loop not running".into(),
+        });
+    }
+
+    let Some(pid) = read_pid_from_file(&pid_file) else {
+        return Ok(VoiceStatus {
+            running: false,
+            detail: "voice loop pid file unreadable".into(),
+        });
+    };
+
+    let running = is_pid_running(pid);
+    Ok(VoiceStatus {
+        running,
+        detail: if running {
+            format!("voice loop running (pid: {pid})")
+        } else {
+            "voice loop pid exists but process is down".into()
+        },
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -548,7 +962,12 @@ pub fn run() {
             voice_feed,
             voice_list_devices,
             voice_get_input_device,
-            voice_set_input_device
+            voice_set_input_device,
+            service_start_api_local,
+            service_stop_api_local,
+            service_start_voice_loop_local,
+            service_stop_voice_loop_local,
+            service_voice_loop_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

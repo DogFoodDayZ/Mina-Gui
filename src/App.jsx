@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from "react";
 import { createPortal } from "react-dom";
+import { invoke } from "@tauri-apps/api/core";
 import "./crt.css";
 import avatarIdle from "./assets/avatar_idle.png";
 import avatarTalk from "./assets/avatar_talk.png";
@@ -8,6 +9,7 @@ import avatarSmirk from "./assets/avatar_smirk.png";
 
 const API_BASE = "http://127.0.0.1:8000";
 const GUI_VOICE_HINT = "en-US-AnaNeural";
+const USER_DISPLAY_NAME = "TRAVIS";
 
 const COMMANDS = [
     "/help",
@@ -28,17 +30,13 @@ export default function App() {
             text: "MK1 LINK STABILIZED. LOCAL CORE AND MEMORY ENDPOINTS ARE LIVE.",
         },
     ]);
-    const [statusNote, setStatusNote] = useState("Waiting for core telemetry...");
+    const [statusNote, setStatusNote] = useState("");
 
     const [showEmoji, setShowEmoji] = useState(false);
     const [emojiPos, setEmojiPos] = useState({ x: 0, y: 0 });
 
     const [systemStatus, setSystemStatus] = useState(null);
     const [dbStatus, setDbStatus] = useState(null);
-    const [memoryQuery, setMemoryQuery] = useState("what is my name");
-    const [memoryWriteText, setMemoryWriteText] = useState("");
-    const [memoryDeleteText, setMemoryDeleteText] = useState("");
-    const [memoryResult, setMemoryResult] = useState("");
     const [imageAttachments, setImageAttachments] = useState([]);
     const [activeImageIndex, setActiveImageIndex] = useState(0);
     const [imageStatus, setImageStatus] = useState("Paste, drop, or choose an image.");
@@ -47,12 +45,29 @@ export default function App() {
         supportsVision: false,
         mode: "TEXT_ONLY",
         ready: false,
+        allowedModels: [],
     });
     const [isCoreSpeaking, setIsCoreSpeaking] = useState(false);
     const [talkFrameAlt, setTalkFrameAlt] = useState(false);
     const [avatarMood, setAvatarMood] = useState("idle");
     const [apiServiceUp, setApiServiceUp] = useState(true);
-    const [fancyGuiServiceUp, setFancyGuiServiceUp] = useState(true);
+    const [voiceServiceUp, setVoiceServiceUp] = useState(false);
+    const [isRefreshing, setIsRefreshing] = useState(false);
+    const [isAskingSummary, setIsAskingSummary] = useState(false);
+    const [isStartingApi, setIsStartingApi] = useState(false);
+    const [isStartingVoice, setIsStartingVoice] = useState(false);
+    const [isOpeningRestore, setIsOpeningRestore] = useState(false);
+    const [isSwitchingModel, setIsSwitchingModel] = useState(false);
+    const [taskWindow, setTaskWindow] = useState({
+        tasks: [],
+        dueCount: 0,
+        upcomingCount: 0,
+        online: false,
+        error: "",
+        lastSync: "",
+    });
+    const [taskActionBusy, setTaskActionBusy] = useState("");
+    const [selectedTaskId, setSelectedTaskId] = useState(null);
 
     const consoleRef = useRef(null);
     const emojiBtnRef = useRef(null);
@@ -61,6 +76,8 @@ export default function App() {
     const lastVoiceEventIdRef = useRef(0);
     const speakTimeoutRef = useRef(null);
     const attachmentsRef = useRef([]);
+    const dueTaskPrimedRef = useRef(false);
+    const seenDueTaskIdsRef = useRef(new Set());
 
     useEffect(() => {
         attachmentsRef.current = imageAttachments;
@@ -117,6 +134,14 @@ export default function App() {
         }
 
         return data;
+    }
+
+    async function invokeTauri(command, args = {}) {
+        try {
+            return await invoke(command, args);
+        } catch {
+            return null;
+        }
     }
 
     function appendMessage(from, text) {
@@ -298,14 +323,14 @@ export default function App() {
                 level: data.level ?? "NORMAL",
             });
 
-            setActivity("Core telemetry refreshed.");
+            setActivity("Mina telemetry refreshed.");
         } catch (err) {
             setSystemStatus((prev) =>
                 prev ?? {
-                    coreTemp: "WAITING FOR CORE...",
-                    memoryBus: "WAITING FOR CORE...",
-                    neuralCache: "WAITING FOR CORE...",
-                    ioChannels: "WAITING FOR CORE...",
+                    coreTemp: "WAITING FOR MINA...",
+                    memoryBus: "WAITING FOR MINA...",
+                    neuralCache: "WAITING FOR MINA...",
+                    ioChannels: "WAITING FOR MINA...",
                     level: "WARN",
                 }
             );
@@ -349,7 +374,13 @@ export default function App() {
     }
 
     async function refreshAllStatus() {
-        await Promise.all([refreshSystemStatus(), refreshDbStatus()]);
+        if (isRefreshing) return;
+        setIsRefreshing(true);
+        try {
+            await Promise.all([refreshSystemStatus(), refreshDbStatus()]);
+        } finally {
+            setIsRefreshing(false);
+        }
     }
 
     useEffect(() => {
@@ -374,10 +405,10 @@ export default function App() {
 
                 setSystemStatus((prev) =>
                     prev ?? {
-                        coreTemp: "WAITING FOR CORE...",
-                        memoryBus: "WAITING FOR CORE...",
-                        neuralCache: "WAITING FOR CORE...",
-                        ioChannels: "WAITING FOR CORE...",
+                        coreTemp: "WAITING FOR MINA...",
+                        memoryBus: "WAITING FOR MINA...",
+                        neuralCache: "WAITING FOR MINA...",
+                        ioChannels: "WAITING FOR MINA...",
                         level: "WARN",
                     }
                 );
@@ -388,6 +419,185 @@ export default function App() {
         pollStatus();
 
         const id = setInterval(pollStatus, 2000);
+
+        return () => {
+            cancelled = true;
+            clearInterval(id);
+        };
+    }, []);
+
+    function mapTaskFeed(data) {
+        function normalizeTaskText(value) {
+            const raw = String(value ?? "");
+            const cleaned = raw
+                .replace(/[\u0000-\u001F\u007F-\u009F\u200B-\u200D\u2060\uFEFF]/g, "")
+                .trim();
+            return cleaned || "(untitled task)";
+        }
+
+        function fmtDue(ts) {
+            if (!ts) return "no due time";
+            try {
+                return new Date(Number(ts) * 1000).toLocaleString([], {
+                    weekday: "short",
+                    month: "short",
+                    day: "2-digit",
+                    hour: "2-digit",
+                    minute: "2-digit",
+                });
+            } catch {
+                return "invalid time";
+            }
+        }
+
+        const tasks = Array.isArray(data?.tasks)
+            ? data.tasks.map((t) => ({
+                id: t?.id,
+                text: normalizeTaskText(t?.text),
+                due: Boolean(t?.due),
+                dueAtText: fmtDue(t?.due_at),
+                status: String(t?.status || "pending"),
+            }))
+            : [];
+
+        return {
+            tasks,
+            dueCount: Number(data?.due_count || 0),
+            upcomingCount: Number(data?.upcoming_count || 0),
+            online: true,
+            error: "",
+            lastSync: new Date().toLocaleTimeString(),
+        };
+    }
+
+    async function refreshTaskWindow() {
+        try {
+            const data = await requestJson("/tasks/list?limit=8");
+            setTaskWindow(mapTaskFeed(data));
+            return true;
+        } catch (err) {
+            setTaskWindow((prev) => ({
+                ...prev,
+                online: false,
+                error: String(err?.message || "task feed unavailable"),
+            }));
+            return false;
+        }
+    }
+
+    async function handleTaskAction(taskId, action, minutes = 0) {
+        const id = Number(taskId || 0);
+        if (!id) return;
+
+        const busyKey = `${action}:${id}`;
+        if (taskActionBusy) return;
+        setTaskActionBusy(busyKey);
+
+        try {
+            if (action === "done") {
+                await requestJson(`/tasks/mark_done?task_id=${id}`, { method: "POST" });
+                setActivity(`Task ${id} marked done.`);
+            } else if (action === "snooze") {
+                const safeMinutes = Math.max(1, Number(minutes || 10));
+                await requestJson(`/tasks/snooze?task_id=${id}&minutes=${safeMinutes}`, { method: "POST" });
+                setActivity(`Task ${id} snoozed ${safeMinutes} minutes.`);
+            }
+
+            await refreshTaskWindow();
+        } catch (err) {
+            setActivity(`Task action failed: ${err.message}`);
+        } finally {
+            setTaskActionBusy("");
+        }
+    }
+
+    useEffect(() => {
+        let cancelled = false;
+
+        function handleDueTaskAnnouncements(mapped) {
+            const dueTasks = (mapped?.tasks || []).filter(
+                (t) => Boolean(t?.due) && String(t?.status || "pending").toLowerCase() !== "done"
+            );
+            const dueIds = dueTasks.map((t) => Number(t?.id || 0)).filter((id) => id > 0);
+
+            if (!dueTaskPrimedRef.current) {
+                seenDueTaskIdsRef.current = new Set(dueIds);
+                dueTaskPrimedRef.current = true;
+                return;
+            }
+
+            const newlyDue = dueTasks.filter((t) => {
+                const id = Number(t?.id || 0);
+                return id > 0 && !seenDueTaskIdsRef.current.has(id);
+            });
+
+            seenDueTaskIdsRef.current = new Set(dueIds);
+
+            if (newlyDue.length === 0) return;
+
+            const first = newlyDue[0];
+            const firstText = String(first?.text || "(untitled task)");
+            const suffix = newlyDue.length > 1 ? ` (+${newlyDue.length - 1} more)` : "";
+            appendMessage("MINA", `Reminder due: ${firstText}${suffix}`);
+            triggerAvatarSpeechPulse(1500);
+        }
+
+        async function pollTasks() {
+            try {
+                const data = await requestJson("/tasks/list?limit=8");
+                if (cancelled) return;
+                const mapped = mapTaskFeed(data);
+                setTaskWindow(mapped);
+                handleDueTaskAnnouncements(mapped);
+                setSelectedTaskId((prev) => {
+                    const ids = mapped.tasks.map((t) => Number(t.id || 0));
+                    if (prev && ids.includes(Number(prev))) {
+                        return Number(prev);
+                    }
+                    return ids.length ? ids[0] : null;
+                });
+            } catch (err) {
+                if (cancelled) return;
+                setTaskWindow((prev) => ({
+                    ...prev,
+                    online: false,
+                    error: String(err?.message || "task feed unavailable"),
+                }));
+            }
+        }
+
+        pollTasks();
+        const id = setInterval(pollTasks, 5000);
+
+        return () => {
+            cancelled = true;
+            clearInterval(id);
+        };
+    }, []);
+
+    useEffect(() => {
+        let cancelled = false;
+
+        async function pollVoiceLoopStatus() {
+            const local = await invokeTauri("service_voice_loop_status");
+            if (cancelled) return;
+
+            if (local && typeof local.running === "boolean") {
+                setVoiceServiceUp(Boolean(local.running));
+                return;
+            }
+
+            try {
+                const remote = await requestJson("/service/voice_loop_status");
+                if (cancelled) return;
+                setVoiceServiceUp(Boolean(remote?.running));
+            } catch {
+                // Best-effort only; leave current indicator unchanged.
+            }
+        }
+
+        pollVoiceLoopStatus();
+        const id = setInterval(pollVoiceLoopStatus, 2200);
 
         return () => {
             cancelled = true;
@@ -422,7 +632,7 @@ export default function App() {
                         appendMessage("VOICE", said);
                     }
                     if (reply) {
-                        appendMessage("CORE", reply);
+                        appendMessage("MINA", reply);
                         triggerAvatarSpeechPulse();
                     }
                     if (toolOutput) {
@@ -448,7 +658,9 @@ export default function App() {
 
         async function pollModelStatus() {
             try {
-                const data = await requestJson("/model/status");
+                const hasStagedImages = (imageAttachments?.length || 0) > 0;
+                const qs = hasStagedImages ? "?check_vision=true" : "?check_vision=false";
+                const data = await requestJson(`/model/status${qs}`);
                 if (cancelled) return;
 
                 setModelStatus({
@@ -456,6 +668,9 @@ export default function App() {
                     supportsVision: Boolean(data?.supports_vision),
                     mode: data?.mode ?? "TEXT_ONLY",
                     ready: true,
+                    allowedModels: Array.isArray(data?.allowed_switch_models)
+                        ? data.allowed_switch_models
+                        : [],
                 });
             } catch {
                 if (cancelled) return;
@@ -474,7 +689,7 @@ export default function App() {
             cancelled = true;
             clearInterval(id);
         };
-    }, []);
+    }, [imageAttachments.length]);
 
     useEffect(() => {
         let cancelled = false;
@@ -575,111 +790,10 @@ export default function App() {
         } catch (err) {
             console.error(err);
             return {
-                text: `(error contacting core: ${err.message})`,
+                text: `(error contacting Mina API: ${err.message})`,
                 image: null,
                 raw: null,
             };
-        }
-    }
-
-    async function readMemory() {
-        const query = memoryQuery.trim();
-
-        if (!query) {
-            setMemoryResult("Enter a memory query first.");
-            return;
-        }
-
-        try {
-            const data = await requestJson(
-                `/memory/read?query=${encodeURIComponent(query)}`
-            );
-
-            const resultText =
-                typeof data?.reply === "string"
-                    ? data.reply
-                    : typeof data?.result === "string"
-                        ? data.result
-                        : JSON.stringify(data, null, 2);
-
-            setMemoryResult(resultText);
-            appendMessage("MEMORY", resultText);
-            setActivity(`Memory read for: ${query}`);
-        } catch (err) {
-            const message = `Memory read failed: ${err.message}`;
-            setMemoryResult(message);
-            appendMessage("MEMORY", message);
-            setActivity(message);
-        }
-    }
-
-    async function writeMemory() {
-        const text = memoryWriteText.trim();
-
-        if (!text) {
-            setMemoryResult("Enter a memory fact first.");
-            return;
-        }
-
-        try {
-            const data = await requestJson("/memory/write", {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                },
-                body: JSON.stringify({
-                    text,
-                    kind: "fact",
-                    tags: ["gui"],
-                }),
-            });
-
-            const message =
-                data?.status ?? data?.reply ?? "Memory write completed.";
-
-            setMemoryResult(message);
-            appendMessage("MEMORY", message);
-            setActivity(`Saved memory fact: ${text}`);
-            setMemoryWriteText("");
-        } catch (err) {
-            const message = `Memory write failed: ${err.message}`;
-            setMemoryResult(message);
-            appendMessage("MEMORY", message);
-            setActivity(message);
-        }
-    }
-
-    async function deleteMemory() {
-        const text = memoryDeleteText.trim();
-
-        if (!text) {
-            setMemoryResult("Enter text to delete first.");
-            return;
-        }
-
-        try {
-            const data = await requestJson("/memory/delete", {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                },
-                body: JSON.stringify({
-                    text,
-                }),
-            });
-
-            const message =
-                data?.status ?? data?.reply ?? "Memory delete completed.";
-
-            setMemoryResult(message);
-            appendMessage("MEMORY", message);
-            setActivity(`Deleted memory rows matching: ${text}`);
-            setMemoryDeleteText("");
-        } catch (err) {
-            const message = `Memory delete failed: ${err.message}`;
-            setMemoryResult(message);
-            appendMessage("MEMORY", message);
-            setActivity(message);
         }
     }
 
@@ -690,7 +804,7 @@ export default function App() {
         setAvatarMood("talk");
         setIsCoreSpeaking(true);
 
-        setMessages((prev) => [...prev, { id: streamId, from: "CORE", text: "" }]);
+        setMessages((prev) => [...prev, { id: streamId, from: "MINA", text: "" }]);
 
         let i = 0;
 
@@ -742,7 +856,7 @@ export default function App() {
                         "/diag - refresh telemetry snapshot\n" +
                         "/clear - clear console\n" +
                         "/system <msg> - local status note\n" +
-                        "/core <msg> - send prompt to core\n" +
+                        "/core <msg> - send prompt to Mina\n" +
                         "/echo <msg> - echo text\n" +
                         "/time - show local time\n" +
                         "/about - system info\n" +
@@ -795,7 +909,7 @@ export default function App() {
     }
 
     function triggerCommand(cmd) {
-        setMessages((prev) => [...prev, { from: "YOU", text: cmd }]);
+        setMessages((prev) => [...prev, { from: USER_DISPLAY_NAME, text: cmd }]);
 
         const result = handleCommand(cmd);
 
@@ -805,14 +919,22 @@ export default function App() {
     }
 
     async function askCoreSummary() {
-        const coreReply = await sendToCore(
-            "Give me a concise current status summary for the core, database, and memory state."
-        );
-        streamCoreReply(coreReply.text);
-        setActivity("Requested a live core summary.");
+        if (isAskingSummary) return;
+        setIsAskingSummary(true);
+        try {
+            const coreReply = await sendToCore(
+                "Give me a concise current status summary for the core, database, and memory state."
+            );
+            streamCoreReply(coreReply.text);
+            setActivity("Requested a live core summary.");
+        } finally {
+            setIsAskingSummary(false);
+        }
     }
 
     async function openRestoreGui() {
+        if (isOpeningRestore) return;
+        setIsOpeningRestore(true);
         try {
             const result = await requestJson("/restore/open", {
                 method: "POST",
@@ -829,16 +951,54 @@ export default function App() {
         } catch (err) {
             appendMessage("SYSTEM", `Restore utility failed to launch: ${err.message}`);
             setActivity(`Restore launch failed: ${err.message}`);
+        } finally {
+            setIsOpeningRestore(false);
         }
     }
 
-    async function startApiService() {
+    async function toggleApiService() {
+        if (isStartingApi) return;
+        setIsStartingApi(true);
+
+        if (apiServiceUp) {
+            const localStop = await invokeTauri("service_stop_api_local");
+            if (localStop?.ok) {
+                setApiServiceUp(false);
+                appendMessage("SYSTEM", "API stop requested via local launcher.");
+                setActivity("API stop requested.");
+                setTimeout(() => {
+                    refreshSystemStatus();
+                    refreshDbStatus();
+                }, 900);
+            } else {
+                appendMessage("SYSTEM", `API stop failed: ${localStop?.error || "unknown_error"}`);
+                setActivity("API stop failed.");
+            }
+            setIsStartingApi(false);
+            return;
+        }
+
+        const local = await invokeTauri("service_start_api_local");
+        if (local?.ok) {
+            appendMessage("SYSTEM", "API start requested via local launcher.");
+            setActivity("API start requested.");
+
+            // Allow startup script to bring the API up before next status poll.
+            setTimeout(() => {
+                refreshSystemStatus();
+                refreshDbStatus();
+            }, 1400);
+            setIsStartingApi(false);
+            return;
+        }
+
         try {
             const result = await requestJson("/service/start_api", {
                 method: "POST",
             });
 
             if (result?.ok) {
+                setApiServiceUp(true);
                 appendMessage("SYSTEM", "API start signal sent.");
                 setActivity("API start requested.");
             } else {
@@ -850,29 +1010,104 @@ export default function App() {
             setApiServiceUp(false);
             appendMessage("SYSTEM", `API start failed: ${err.message}`);
             setActivity(`API start failed: ${err.message}`);
+        } finally {
+            setIsStartingApi(false);
         }
     }
 
-    async function openFancyGuiWindow() {
+    async function toggleVoiceLoopService() {
+        if (isStartingVoice) return;
+        setIsStartingVoice(true);
+
+        if (voiceServiceUp) {
+            const localStop = await invokeTauri("service_stop_voice_loop_local");
+            if (localStop?.ok) {
+                setVoiceServiceUp(false);
+                appendMessage("SYSTEM", "Voice loop stop requested via local launcher.");
+                setActivity("Voice loop stop requested.");
+            } else {
+                appendMessage("SYSTEM", `Voice loop stop failed: ${localStop?.error || "unknown_error"}`);
+                setActivity("Voice loop stop failed.");
+            }
+            setIsStartingVoice(false);
+            return;
+        }
+
+        const local = await invokeTauri("service_start_voice_loop_local");
+        if (local?.ok) {
+            appendMessage("SYSTEM", `Voice loop launch requested via local launcher. PID: ${local.pid ?? "unknown"}`);
+            setActivity("Voice loop start requested.");
+
+            setVoiceServiceUp(true);
+            setTimeout(async () => {
+                const verified = await invokeTauri("service_voice_loop_status");
+                if (verified && typeof verified.running === "boolean") {
+                    setVoiceServiceUp(Boolean(verified.running));
+                    appendMessage("SYSTEM", verified.detail || (verified.running ? "Voice loop running." : "Voice loop stopped."));
+                }
+            }, 900);
+            setIsStartingVoice(false);
+            return;
+        }
+
+        setVoiceServiceUp(false);
+        appendMessage("SYSTEM", "Voice loop start failed: local launcher unavailable or returned an error.");
+        setActivity("Voice loop start failed.");
+        setIsStartingVoice(false);
+    }
+
+    function compactModelName(name) {
+        const raw = String(name || "").trim();
+        if (!raw) return "MODEL";
+        if (raw.length <= 20) return raw;
+        const slash = raw.includes("/") ? raw.split("/").pop() : raw;
+        if (slash && slash.length <= 20) return slash;
+        return `${raw.slice(0, 17)}...`;
+    }
+
+    async function switchModel(modelName) {
+        const target = String(modelName || "").trim();
+        if (!target || isSwitchingModel) return;
+        if (target.toLowerCase() === String(modelStatus.model || "").toLowerCase()) {
+            setActivity(`Model already active: ${target}`);
+            return;
+        }
+
+        setIsSwitchingModel(true);
         try {
-            const result = await requestJson("/service/open_fancy_gui", {
+            const data = await requestJson("/model/select", {
                 method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    model: target,
+                    autoload: true,
+                    persist: true,
+                    force_reload: false,
+                }),
             });
 
-            if (result?.ok) {
-                setFancyGuiServiceUp(true);
-                appendMessage("SYSTEM", "Fancy GUI launch requested.");
-                setActivity("Fancy GUI launch requested.");
-            } else {
-                const err = result?.error || "unknown_error";
-                setFancyGuiServiceUp(false);
-                appendMessage("SYSTEM", `Fancy GUI launch failed: ${err}`);
-                setActivity(`Fancy GUI launch failed: ${err}`);
+            if (!data?.ok) {
+                const err = data?.error || "model_switch_failed";
+                appendMessage("SYSTEM", `Model switch failed: ${err}`);
+                setActivity(`Model switch failed: ${err}`);
+                return;
             }
+
+            setModelStatus((prev) => ({
+                ...prev,
+                model: String(data.active_model || target),
+                ready: true,
+            }));
+
+            appendMessage("SYSTEM", `Model active: ${data.active_model || target}`);
+            setActivity(`Model switched to ${data.active_model || target}`);
         } catch (err) {
-            setFancyGuiServiceUp(false);
-            appendMessage("SYSTEM", `Fancy GUI launch failed: ${err.message}`);
-            setActivity(`Fancy GUI launch failed: ${err.message}`);
+            appendMessage("SYSTEM", `Model switch failed: ${err.message}`);
+            setActivity(`Model switch failed: ${err.message}`);
+        } finally {
+            setIsSwitchingModel(false);
         }
     }
 
@@ -905,7 +1140,7 @@ export default function App() {
         setMessages((prev) => [
             ...prev,
             {
-                from: "YOU",
+                from: USER_DISPLAY_NAME,
                 text: payload,
             },
         ]);
@@ -945,12 +1180,6 @@ export default function App() {
     }
 
     async function handleSendImage() {
-        if (!modelStatus.ready || !modelStatus.supportsVision) {
-            setImageStatus("SEND>IMG is disabled until a vision-capable model is active.");
-            appendMessage("SYSTEM", "SEND>IMG blocked: active model is not image-capable.");
-            return;
-        }
-
         const activeAttachment = imageAttachments[activeImageIndex] || imageAttachments[0] || null;
         if (!activeAttachment?.dataUrl) {
             setImageStatus("Stage an image first, then use SEND>IMG.");
@@ -964,7 +1193,7 @@ export default function App() {
         setMessages((prev) => [
             ...prev,
             {
-                from: "YOU",
+                from: USER_DISPLAY_NAME,
                 text: `[IMG] ${composedPrompt}`,
             },
         ]);
@@ -1079,11 +1308,12 @@ export default function App() {
 
     function getColorForSender(from) {
         if (from === "SYSTEM") return "#ffb000";
-        if (from === "CORE") return "#00ff88";
+        if (from === "MINA") return "#00ff88";
         if (from === "CMD") return "#00e0ff";
         if (from === "MEMORY") return "#ff8c00";
         if (from === "VOICE") return "#9ad1ff";
         if (from === "TOOL") return "#ffd27d";
+        if (from === USER_DISPLAY_NAME) return "#e0e0e0";
         if (from === "YOU") return "#e0e0e0";
 
         return "#e0e0e0";
@@ -1106,10 +1336,10 @@ export default function App() {
         }
     }
 
-    const coreTempText = systemStatus?.coreTemp ?? "WAITING FOR CORE...";
-    const memoryBusText = systemStatus?.memoryBus ?? "WAITING FOR CORE...";
-    const neuralCacheText = systemStatus?.neuralCache ?? "WAITING FOR CORE...";
-    const ioChannelsText = systemStatus?.ioChannels ?? "WAITING FOR CORE...";
+    const coreTempText = systemStatus?.coreTemp ?? "WAITING FOR MINA...";
+    const memoryBusText = systemStatus?.memoryBus ?? "WAITING FOR MINA...";
+    const neuralCacheText = systemStatus?.neuralCache ?? "WAITING FOR MINA...";
+    const ioChannelsText = systemStatus?.ioChannels ?? "WAITING FOR MINA...";
     const statusLevel = systemStatus?.level ?? "WARN";
     const statusColor = getStatusColor(statusLevel);
 
@@ -1131,11 +1361,12 @@ export default function App() {
         ? "mk1-vision-badge mk1-vision-on"
         : "mk1-vision-badge mk1-vision-muted";
     const apiServiceClass = apiServiceUp ? "mk1-service-badge mk1-service-up" : "mk1-service-badge mk1-service-down";
-    const fancyServiceClass = fancyGuiServiceUp ? "mk1-service-badge mk1-service-up" : "mk1-service-badge mk1-service-down";
-
+    const voiceServiceClass = voiceServiceUp ? "mk1-service-badge mk1-service-up" : "mk1-service-badge mk1-service-down";
     const avatarSrc = isCoreSpeaking
         ? (talkFrameAlt ? avatarTalk2 : avatarTalk)
         : (avatarMood === "smirk" ? avatarSmirk : avatarIdle);
+    const selectedTask = taskWindow.tasks.find((t) => Number(t.id || 0) === Number(selectedTaskId || 0)) || null;
+    const taskActionTarget = selectedTask || taskWindow.tasks[0] || null;
 
     return (
         <>
@@ -1257,11 +1488,11 @@ export default function App() {
                                 <span className="mk1-chat-label">MK1</span>
 
                                 <span className="mk1-chat-text">
-                                    {systemStatus?.level === "NORMAL" && " CORE ONLINE"}
-                                    {systemStatus?.level === "WARN" && " CORE DEGRADED"}
-                                    {systemStatus?.level === "ERROR" && " CORE ERROR"}
-                                    {systemStatus?.level === "CRITICAL" && " CORE FAILURE"}
-                                    {!systemStatus?.level && " WAITING FOR CORE..."}
+                                    {systemStatus?.level === "NORMAL" && " MINA ONLINE"}
+                                    {systemStatus?.level === "WARN" && " MINA DEGRADED"}
+                                    {systemStatus?.level === "ERROR" && " MINA ERROR"}
+                                    {systemStatus?.level === "CRITICAL" && " MINA FAILURE"}
+                                    {!systemStatus?.level && " WAITING FOR MINA..."}
                                 </span>
                             </div>
 
@@ -1324,79 +1555,52 @@ export default function App() {
                     </div>
 
                     <section className="mk1-right-stack">
-                        <div className="mk1-panel mk1-crt-amber mk1-right-top">
-                            <div className="mk1-panel-title">CORE ACTIONS</div>
+                        <div className="mk1-panel mk1-crt-amber mk1-right-top mk1-actions-dock">
+                            <div className="mk1-panel-title">MINA ACTIONS</div>
 
                             <div className="mk1-panel-body">
-                                <button className="mk1-btn" onClick={refreshAllStatus}>
-                                    REFRESH STATUS
+                                <button className="mk1-btn" onClick={refreshAllStatus} disabled={isRefreshing}>
+                                    {isRefreshing ? "REFRESHING..." : "REFRESH STATUS"}
                                 </button>
 
-                                <button className="mk1-btn" onClick={askCoreSummary}>
-                                    ASK CORE FOR SUMMARY
+                                <button className="mk1-btn" onClick={askCoreSummary} disabled={isAskingSummary}>
+                                    {isAskingSummary ? "ASKING MINA..." : "ASK MINA FOR SUMMARY"}
                                 </button>
 
-                                <button className="mk1-btn" onClick={readMemory}>
-                                    READ MEMORY QUERY
-                                </button>
-
-                                <div className="mk1-service-row">
-                                    <span className={fancyServiceClass}>{fancyGuiServiceUp ? "FANCY GUI ACTIVE" : "FANCY GUI DOWN"}</span>
-                                    <button className="mk1-mini-action" type="button" onClick={openFancyGuiWindow}>
-                                        START FANCY GUI
-                                    </button>
+                                <div className="mk1-mini-field">
+                                    <div className="mk1-mini-label">Model switch</div>
+                                    <div className="mk1-model-chip-row">
+                                        {(modelStatus.allowedModels || []).map((name) => {
+                                            const active = String(name).toLowerCase() === String(modelStatus.model || "").toLowerCase();
+                                            return (
+                                                <button
+                                                    key={name}
+                                                    className={`mk1-model-chip ${active ? "is-active" : ""}`}
+                                                    type="button"
+                                                    disabled={isSwitchingModel || active}
+                                                    onClick={() => switchModel(name)}
+                                                    title={name}
+                                                >
+                                                    {compactModelName(name)}
+                                                </button>
+                                            );
+                                        })}
+                                    </div>
                                 </div>
 
                                 <div className="mk1-service-row">
                                     <span className={apiServiceClass}>{apiServiceUp ? "API ACTIVE" : "API DOWN"}</span>
-                                    <button className="mk1-mini-action" type="button" onClick={startApiService}>
-                                        START API
+                                    <button className="mk1-mini-action" type="button" onClick={toggleApiService} disabled={isStartingApi}>
+                                        {isStartingApi ? (apiServiceUp ? "STOPPING..." : "STARTING...") : (apiServiceUp ? "STOP API" : "START API")}
                                     </button>
                                 </div>
 
-                                <div className="mk1-mini-field">
-                                    <div className="mk1-mini-label">Memory query</div>
-
-                                    <textarea
-                                        className="mk1-mini-input"
-                                        value={memoryQuery}
-                                        onChange={(e) => setMemoryQuery(e.target.value)}
-                                        placeholder="ask about name, workspace, last project, or a fact"
-                                        rows={3}
-                                    />
+                                <div className="mk1-service-row">
+                                    <span className={voiceServiceClass}>{voiceServiceUp ? "VOICE ACTIVE" : "VOICE DOWN"}</span>
+                                    <button className="mk1-mini-action" type="button" onClick={toggleVoiceLoopService} disabled={isStartingVoice}>
+                                        {isStartingVoice ? (voiceServiceUp ? "STOPPING..." : "STARTING...") : (voiceServiceUp ? "STOP VOICE LOOP" : "START VOICE LOOP")}
+                                    </button>
                                 </div>
-
-                                <div className="mk1-mini-field">
-                                    <div className="mk1-mini-label">Write memory</div>
-
-                                    <textarea
-                                        className="mk1-mini-input"
-                                        value={memoryWriteText}
-                                        onChange={(e) => setMemoryWriteText(e.target.value)}
-                                        placeholder="my favorite editor is..."
-                                        rows={3}
-                                    />
-                                </div>
-
-                                <button className="mk1-btn" onClick={writeMemory}>
-                                    SAVE MEMORY FACT
-                                </button>
-
-                                <div className="mk1-mini-field">
-                                    <div className="mk1-mini-label">Delete memory text</div>
-
-                                    <textarea
-                                        className="mk1-mini-input"
-                                        value={memoryDeleteText}
-                                        onChange={(e) => setMemoryDeleteText(e.target.value)}
-                                        placeholder="text to remove from memory"
-                                        rows={2}
-                                    />
-                                </div>
-
-                                <button className="mk1-btn" onClick={deleteMemory}>
-                                    DELETE MEMORY TEXT
-                                </button>
 
                                 <button className="mk1-btn" onClick={() => triggerCommand("/time")}>
                                     SHOW LOCAL TIME
@@ -1406,16 +1610,48 @@ export default function App() {
                                     CLEAR CONSOLE
                                 </button>
 
-                                <div className="mk1-panel-note">{statusNote}</div>
+                                <div className="mk1-task-actions-inline">
+                                    <div className="mk1-task-rail-title">TASK ACTIONS</div>
+                                    <div className="mk1-task-actions-rail mk1-task-actions-rail-inline" aria-label="Task actions">
+                                        <button
+                                            className="mk1-task-btn"
+                                            type="button"
+                                            disabled={!taskActionTarget || Boolean(taskActionBusy)}
+                                            onClick={() => taskActionTarget && handleTaskAction(taskActionTarget.id, "done")}
+                                            title="Mark selected task done"
+                                        >
+                                            {taskActionTarget && taskActionBusy === `done:${taskActionTarget.id}` ? "..." : "DONE"}
+                                        </button>
+                                        <button
+                                            className="mk1-task-btn"
+                                            type="button"
+                                            disabled={!taskActionTarget || Boolean(taskActionBusy)}
+                                            onClick={() => taskActionTarget && handleTaskAction(taskActionTarget.id, "snooze", 10)}
+                                            title="Snooze selected task 10 minutes"
+                                        >
+                                            {taskActionTarget && taskActionBusy === `snooze:${taskActionTarget.id}` ? "..." : "+10m"}
+                                        </button>
+                                        <button
+                                            className="mk1-task-btn"
+                                            type="button"
+                                            disabled={!taskActionTarget || Boolean(taskActionBusy)}
+                                            onClick={() => taskActionTarget && handleTaskAction(taskActionTarget.id, "snooze", 30)}
+                                            title="Snooze selected task 30 minutes"
+                                        >
+                                            {taskActionTarget && taskActionBusy === `snooze:${taskActionTarget.id}` ? "..." : "+30m"}
+                                        </button>
+                                        <div className="mk1-task-rail-meta">{taskActionTarget ? `ID ${taskActionTarget.id}` : "NO TASK"}</div>
+                                    </div>
+                                </div>
 
-                                {memoryResult && <div className="mk1-mini-output">{memoryResult}</div>}
+                                {statusNote && <div className="mk1-panel-note">{statusNote}</div>}
                             </div>
                         </div>
 
                         <div className="mk1-panel mk1-crt-amber mk1-right-bottom">
                             <div className="mk1-panel-title">SYSTEM</div>
 
-                            <div className="mk1-panel-body">
+                            <div className="mk1-panel-body mk1-system-body">
                                 <div className="mk1-kv">
                                     <span className="mk1-k">CORE TEMP</span>
 
@@ -1516,13 +1752,45 @@ export default function App() {
                             </div>
 
                             <div className="mk1-corner-actions">
-                                <button className="mk1-restore-btn" type="button" onClick={openRestoreGui}>
-                                    OPEN RESTORE
+                                <button className="mk1-restore-btn" type="button" onClick={openRestoreGui} disabled={isOpeningRestore}>
+                                    {isOpeningRestore ? "OPENING..." : "OPEN RESTORE"}
                                 </button>
                             </div>
                         </div>
                     </section>
                 </main>
+
+                <aside className="mk1-task-window" aria-label="Mina task queue">
+                    <div className="mk1-task-window-title">TASK QUEUE</div>
+                    <div className="mk1-task-window-meta">
+                        <span>DUE {taskWindow.dueCount}</span>
+                        <span>UPCOMING {taskWindow.upcomingCount}</span>
+                        <span>{taskWindow.online ? "ONLINE" : "OFFLINE"}</span>
+                    </div>
+
+                    <div className="mk1-task-window-body">
+                        {taskWindow.tasks.length === 0 && (
+                            <div className="mk1-task-empty">No queued tasks in memory.</div>
+                        )}
+
+                        {taskWindow.tasks.map((task) => (
+                            <button
+                                key={String(task.id)}
+                                className={`mk1-task-item ${task.due ? "is-due" : ""} ${Number(selectedTaskId || 0) === Number(task.id || 0) ? "is-selected" : ""}`}
+                                type="button"
+                                onClick={() => setSelectedTaskId(Number(task.id || 0))}
+                            >
+                                <div className="mk1-task-text">{task.text}</div>
+                                <div className="mk1-task-sub">{task.due ? "DUE" : "UPCOMING"} at {task.dueAtText}</div>
+                            </button>
+                        ))}
+                    </div>
+
+                    <div className="mk1-task-window-footer">
+                        {taskWindow.error ? `Task feed: ${taskWindow.error}` : `Last sync ${taskWindow.lastSync}`}
+                    </div>
+                </aside>
+
             </div>
 
             {showEmoji &&
