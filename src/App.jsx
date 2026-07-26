@@ -6,6 +6,7 @@ import avatarIdle from "./assets/avatar_idle.png";
 import avatarTalk from "./assets/avatar_talk.png";
 import avatarTalk2 from "./assets/avatar_talk_2.png";
 import avatarSmirk from "./assets/avatar_smirk.png";
+import OstranautsCompanion from "./components/OstranautsCompanion";
 
 const API_BASE = "http://127.0.0.1:8000";
 const GUI_VOICE_HINT = "en-US-AnaNeural";
@@ -22,7 +23,32 @@ const COMMANDS = [
     "/about",
 ];
 
+function startSerialPoll(poll, intervalMs) {
+    let stopped = false;
+    let timeoutId = null;
+
+    async function run() {
+        try {
+            await poll();
+        } catch (err) {
+            console.error("Polling task failed", err);
+        } finally {
+            if (!stopped) {
+                timeoutId = setTimeout(run, intervalMs);
+            }
+        }
+    }
+
+    void run();
+
+    return () => {
+        stopped = true;
+        if (timeoutId) clearTimeout(timeoutId);
+    };
+}
+
 export default function App() {
+    const isOstranautsCompanion = new URLSearchParams(window.location.search).get("view") === "ostranauts";
     const [input, setInput] = useState("");
     const [messages, setMessages] = useState([
         {
@@ -56,6 +82,7 @@ export default function App() {
     const [isAskingSummary, setIsAskingSummary] = useState(false);
     const [isStartingApi, setIsStartingApi] = useState(false);
     const [isStartingVoice, setIsStartingVoice] = useState(false);
+    const [voiceOutputOn, setVoiceOutputOn] = useState(false);
     const [isOpeningRestore, setIsOpeningRestore] = useState(false);
     const [isSwitchingModel, setIsSwitchingModel] = useState(false);
     const [taskWindow, setTaskWindow] = useState({
@@ -73,7 +100,10 @@ export default function App() {
     const emojiBtnRef = useRef(null);
     const emojiPanelRef = useRef(null);
     const imageInputRef = useRef(null);
-    const lastVoiceEventIdRef = useRef(0);
+    const lastVoiceEventIdRef = useRef(
+        Number(window.sessionStorage.getItem("mina:lastVoiceEventId") || 0)
+    );
+    const lastCuriosityEventIdRef = useRef(0);
     const speakTimeoutRef = useRef(null);
     const attachmentsRef = useRef([]);
     const dueTaskPrimedRef = useRef(false);
@@ -112,28 +142,48 @@ export default function App() {
     }, [isCoreSpeaking]);
 
     async function requestJson(path, options = {}) {
-        const res = await fetch(`${API_BASE}${path}`, options);
-        const text = await res.text();
-        let data = null;
+        const { timeoutMs = 15000, ...fetchOptions } = options;
+        const controller = new AbortController();
+        let timedOut = false;
+        const timeoutId = setTimeout(() => {
+            timedOut = true;
+            controller.abort();
+        }, timeoutMs);
 
-        if (text) {
-            try {
-                data = JSON.parse(text);
-            } catch {
-                data = text;
+        try {
+            const res = await fetch(`${API_BASE}${path}`, {
+                ...fetchOptions,
+                signal: controller.signal,
+            });
+            const text = await res.text();
+            let data = null;
+
+            if (text) {
+                try {
+                    data = JSON.parse(text);
+                } catch {
+                    data = text;
+                }
             }
+
+            if (!res.ok) {
+                const message =
+                    typeof data === "string"
+                        ? data
+                        : data?.detail ?? data?.error ?? `HTTP ${res.status}`;
+
+                throw new Error(message);
+            }
+
+            return data;
+        } catch (err) {
+            if (timedOut) {
+                throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s`);
+            }
+            throw err;
+        } finally {
+            clearTimeout(timeoutId);
         }
-
-        if (!res.ok) {
-            const message =
-                typeof data === "string"
-                    ? data
-                    : data?.detail ?? data?.error ?? `HTTP ${res.status}`;
-
-            throw new Error(message);
-        }
-
-        return data;
     }
 
     async function invokeTauri(command, args = {}) {
@@ -416,13 +466,11 @@ export default function App() {
             }
         }
 
-        pollStatus();
-
-        const id = setInterval(pollStatus, 2000);
+        const stopPolling = startSerialPoll(pollStatus, 2000);
 
         return () => {
             cancelled = true;
-            clearInterval(id);
+            stopPolling();
         };
     }, []);
 
@@ -566,12 +614,11 @@ export default function App() {
             }
         }
 
-        pollTasks();
-        const id = setInterval(pollTasks, 5000);
+        const stopPolling = startSerialPoll(pollTasks, 5000);
 
         return () => {
             cancelled = true;
-            clearInterval(id);
+            stopPolling();
         };
     }, []);
 
@@ -596,12 +643,11 @@ export default function App() {
             }
         }
 
-        pollVoiceLoopStatus();
-        const id = setInterval(pollVoiceLoopStatus, 2200);
+        const stopPolling = startSerialPoll(pollVoiceLoopStatus, 2200);
 
         return () => {
             cancelled = true;
-            clearInterval(id);
+            stopPolling();
         };
     }, []);
 
@@ -610,12 +656,23 @@ export default function App() {
 
         async function pollVoiceEvents() {
             try {
+                const requestedSinceId = lastVoiceEventIdRef.current;
                 const events = await requestJson(
-                    `/events/recent?since_id=${lastVoiceEventIdRef.current}&source=voice&limit=25`
+                    `/events/recent?since_id=${requestedSinceId}&source=voice&limit=25`
                 );
 
                 if (cancelled || !Array.isArray(events) || events.length === 0) {
                     return;
+                }
+
+                const returnedIds = events
+                    .map((event) => Number(event?.id || 0))
+                    .filter((eventId) => eventId > 0);
+                const maxReturnedId = returnedIds.length ? Math.max(...returnedIds) : 0;
+                const eventStreamReset = requestedSinceId > 0 && maxReturnedId > 0 && maxReturnedId < requestedSinceId;
+
+                if (eventStreamReset) {
+                    lastVoiceEventIdRef.current = 0;
                 }
 
                 for (const ev of events) {
@@ -639,17 +696,55 @@ export default function App() {
                         appendMessage("TOOL", toolOutput);
                     }
                 }
+
+                window.sessionStorage.setItem(
+                    "mina:lastVoiceEventId",
+                    String(lastVoiceEventIdRef.current)
+                );
             } catch {
                 // Keep polling quietly; voice sync is best-effort.
             }
         }
 
-        pollVoiceEvents();
-        const id = setInterval(pollVoiceEvents, 1500);
+        const stopPolling = startSerialPoll(pollVoiceEvents, 1500);
 
         return () => {
             cancelled = true;
-            clearInterval(id);
+            stopPolling();
+        };
+    }, []);
+
+    useEffect(() => {
+        let cancelled = false;
+
+        async function pollCuriosityEvents() {
+            try {
+                const events = await requestJson(
+                    `/curiosity/events?since_id=${lastCuriosityEventIdRef.current}&limit=10`
+                );
+                if (cancelled || !Array.isArray(events)) return;
+
+                for (const event of events) {
+                    const eventId = Number(event?.id || 0);
+                    if (eventId > lastCuriosityEventIdRef.current) {
+                        lastCuriosityEventIdRef.current = eventId;
+                    }
+                    const message = String(event?.message || "").trim();
+                    if (message) {
+                        appendMessage("MINA", message);
+                        triggerAvatarSpeechPulse(1800);
+                    }
+                }
+            } catch {
+                // Curiosity is optional and may be unavailable during API restarts.
+            }
+        }
+
+        const stopPolling = startSerialPoll(pollCuriosityEvents, 5000);
+
+        return () => {
+            cancelled = true;
+            stopPolling();
         };
     }, []);
 
@@ -682,12 +777,11 @@ export default function App() {
             }
         }
 
-        pollModelStatus();
-        const id = setInterval(pollModelStatus, 5000);
+        const stopPolling = startSerialPoll(pollModelStatus, 5000);
 
         return () => {
             cancelled = true;
-            clearInterval(id);
+            stopPolling();
         };
     }, [imageAttachments.length]);
 
@@ -730,13 +824,11 @@ export default function App() {
             }
         }
 
-        pollDbStatus();
-
-        const id = setInterval(pollDbStatus, 2000);
+        const stopPolling = startSerialPoll(pollDbStatus, 2000);
 
         return () => {
             cancelled = true;
-            clearInterval(id);
+            stopPolling();
         };
     }, []);
 
@@ -744,7 +836,7 @@ export default function App() {
         try {
             const payload = {
                 input: userText,
-                speak_response: true,
+                speak_response: Boolean(voiceOutputOn),
                 voice_hint: GUI_VOICE_HINT,
             };
 
@@ -762,6 +854,7 @@ export default function App() {
 
             const reply = await requestJson("/process", {
                 method: "POST",
+                timeoutMs: 180000,
                 headers: {
                     "Content-Type": "application/json",
                 },
@@ -1056,6 +1149,19 @@ export default function App() {
         setIsStartingVoice(false);
     }
 
+    function toggleVoiceOutput() {
+        if (voiceOutputOn) {
+            setVoiceOutputOn(false);
+            appendMessage("SYSTEM", "Voice output disabled for desktop replies.");
+            setActivity("Voice output OFF.");
+            return;
+        }
+
+        setVoiceOutputOn(true);
+        appendMessage("SYSTEM", "Voice output enabled for desktop replies.");
+        setActivity("Voice output ON.");
+    }
+
     function compactModelName(name) {
         const raw = String(name || "").trim();
         if (!raw) return "MODEL";
@@ -1077,6 +1183,7 @@ export default function App() {
         try {
             const data = await requestJson("/model/select", {
                 method: "POST",
+                timeoutMs: 120000,
                 headers: {
                     "Content-Type": "application/json",
                 },
@@ -1368,6 +1475,16 @@ export default function App() {
     const selectedTask = taskWindow.tasks.find((t) => Number(t.id || 0) === Number(selectedTaskId || 0)) || null;
     const taskActionTarget = selectedTask || taskWindow.tasks[0] || null;
 
+    if (isOstranautsCompanion) {
+        return (
+            <OstranautsCompanion
+                avatarSrc={avatarSrc}
+                askMina={sendToCore}
+                onClose={() => invokeTauri("close_ostranauts_companion")}
+            />
+        );
+    }
+
     return (
         <>
             <div className="mk1-root">
@@ -1567,6 +1684,10 @@ export default function App() {
                                     {isAskingSummary ? "ASKING MINA..." : "ASK MINA FOR SUMMARY"}
                                 </button>
 
+                                <button className="mk1-btn" onClick={() => invokeTauri("open_ostranauts_companion")}>
+                                    OPEN OSTRANAUTS COMPANION
+                                </button>
+
                                 <div className="mk1-mini-field">
                                     <div className="mk1-mini-label">Model switch</div>
                                     <div className="mk1-model-chip-row">
@@ -1596,9 +1717,18 @@ export default function App() {
                                 </div>
 
                                 <div className="mk1-service-row">
-                                    <span className={voiceServiceClass}>{voiceServiceUp ? "VOICE ACTIVE" : "VOICE DOWN"}</span>
+                                    <span className={voiceServiceClass}>{voiceServiceUp ? "VOICE INPUT ON" : "VOICE INPUT OFF"}</span>
                                     <button className="mk1-mini-action" type="button" onClick={toggleVoiceLoopService} disabled={isStartingVoice}>
-                                        {isStartingVoice ? (voiceServiceUp ? "STOPPING..." : "STARTING...") : (voiceServiceUp ? "STOP VOICE LOOP" : "START VOICE LOOP")}
+                                        {isStartingVoice ? (voiceServiceUp ? "STOPPING..." : "STARTING...") : (voiceServiceUp ? "STOP VOICE IN" : "START VOICE IN")}
+                                    </button>
+                                </div>
+
+                                <div className="mk1-service-row">
+                                    <span className={voiceOutputOn ? "mk1-service-badge mk1-service-up" : "mk1-service-badge mk1-service-down"}>
+                                        {voiceOutputOn ? "VOICE OUTPUT ON" : "VOICE OUTPUT OFF"}
+                                    </span>
+                                    <button className="mk1-mini-action" type="button" onClick={toggleVoiceOutput}>
+                                        {voiceOutputOn ? "STOP VOICE OUT" : "START VOICE OUT"}
                                     </button>
                                 </div>
 

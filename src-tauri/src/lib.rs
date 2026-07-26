@@ -1,5 +1,5 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -10,6 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
+use tauri::{Manager, PhysicalPosition, PhysicalSize, Position, Size, WebviewUrl, WebviewWindow, WebviewWindowBuilder, Window};
 
 static VOICE_LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static VOICE_CHILD: Mutex<Option<Child>> = Mutex::new(None);
@@ -53,6 +54,310 @@ struct VoiceDeviceConfig {
 #[derive(Serialize)]
 struct ChatReply {
     text: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct WindowPlacement {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    maximized: bool,
+    fullscreen: bool,
+    monitor_name: Option<String>,
+}
+
+fn window_placement_path(window: &Window) -> Result<std::path::PathBuf, String> {
+    let directory = window
+        .app_handle()
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    Ok(directory.join("window-placement.json"))
+}
+
+fn placement_geometry_valid(placement: &WindowPlacement) -> bool {
+    placement.x > -30000
+        && placement.y > -30000
+        && placement.width >= 800
+        && placement.height >= 600
+}
+
+fn read_window_placement(window: &Window) -> Option<WindowPlacement> {
+    let path = window_placement_path(window).ok()?;
+    let content = fs::read_to_string(path).ok()?;
+    let placement = serde_json::from_str::<WindowPlacement>(&content).ok()?;
+    placement_geometry_valid(&placement).then_some(placement)
+}
+
+fn write_window_placement(window: &Window, placement: &WindowPlacement) -> Result<(), String> {
+    let content = serde_json::to_string_pretty(placement).map_err(|error| error.to_string())?;
+    fs::write(window_placement_path(window)?, content).map_err(|error| error.to_string())
+}
+
+fn capture_window_placement(window: &Window) -> Result<WindowPlacement, String> {
+    let position = window.outer_position().map_err(|error| error.to_string())?;
+    let size = window.outer_size().map_err(|error| error.to_string())?;
+    let minimized = window.is_minimized().map_err(|error| error.to_string())?;
+    if minimized || position.x <= -30000 || position.y <= -30000 || size.width < 800 || size.height < 600 {
+        return Err("window_geometry_transient".to_string());
+    }
+    let monitor_name = window
+        .current_monitor()
+        .map_err(|error| error.to_string())?
+        .and_then(|monitor| monitor.name().cloned());
+
+    Ok(WindowPlacement {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+        maximized: window.is_maximized().map_err(|error| error.to_string())?,
+        fullscreen: window.is_fullscreen().map_err(|error| error.to_string())?,
+        monitor_name,
+    })
+}
+
+fn persist_window_placement(window: &Window) -> Result<WindowPlacement, String> {
+    let maximized = window.is_maximized().map_err(|error| error.to_string())?;
+    let fullscreen = window.is_fullscreen().map_err(|error| error.to_string())?;
+    let placement = if maximized || fullscreen {
+        let mut saved = read_window_placement(window).ok_or("normal_window_geometry_unavailable")?;
+        saved.maximized = maximized;
+        saved.fullscreen = fullscreen;
+        saved.monitor_name = window
+            .current_monitor()
+            .map_err(|error| error.to_string())?
+            .and_then(|monitor| monitor.name().cloned());
+        saved
+    } else {
+        capture_window_placement(window)?
+    };
+    write_window_placement(window, &placement)?;
+    Ok(placement)
+}
+
+#[tauri::command]
+fn window_save_placement(window: Window) -> Result<WindowPlacement, String> {
+    persist_window_placement(&window)
+}
+
+#[tauri::command]
+fn window_restore_placement(window: Window) -> Result<serde_json::Value, String> {
+    let path = window_placement_path(&window)?;
+    if !path.exists() {
+        return Ok(serde_json::json!({ "ok": true, "restored": false }));
+    }
+
+    let content = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let placement: WindowPlacement = serde_json::from_str(&content).map_err(|error| error.to_string())?;
+    if !placement_geometry_valid(&placement) {
+        return Ok(serde_json::json!({ "ok": true, "restored": false, "reason": "saved_geometry_invalid" }));
+    }
+    let monitors = window.available_monitors().map_err(|error| error.to_string())?;
+    let target_monitor = placement
+        .monitor_name
+        .as_ref()
+        .and_then(|name| monitors.iter().find(|monitor| monitor.name() == Some(name)))
+        .or_else(|| {
+            monitors.iter().find(|monitor| {
+                let position = monitor.position();
+                let size = monitor.size();
+                placement.x >= position.x
+                    && placement.x < position.x + size.width as i32
+                    && placement.y >= position.y
+                    && placement.y < position.y + size.height as i32
+            })
+        });
+
+    let Some(monitor) = target_monitor else {
+        return Ok(serde_json::json!({ "ok": true, "restored": false, "reason": "saved_monitor_unavailable" }));
+    };
+
+    let monitor_position = monitor.position();
+    let monitor_size = monitor.size();
+    let width = placement.width.clamp(800, monitor_size.width);
+    let height = placement.height.clamp(600, monitor_size.height);
+    let max_x = monitor_position.x + monitor_size.width.saturating_sub(width) as i32;
+    let max_y = monitor_position.y + monitor_size.height.saturating_sub(height) as i32;
+    let x = placement.x.clamp(monitor_position.x, max_x);
+    let y = placement.y.clamp(monitor_position.y, max_y);
+
+    window.set_fullscreen(false).map_err(|error| error.to_string())?;
+    window.unmaximize().map_err(|error| error.to_string())?;
+    window
+        .set_position(Position::Physical(PhysicalPosition::new(x, y)))
+        .map_err(|error| error.to_string())?;
+    window
+        .set_size(Size::Physical(PhysicalSize::new(width, height)))
+        .map_err(|error| error.to_string())?;
+
+    if placement.maximized {
+        window.maximize().map_err(|error| error.to_string())?;
+    }
+    if placement.fullscreen {
+        window.set_fullscreen(true).map_err(|error| error.to_string())?;
+    }
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "restored": true,
+        "monitor": monitor.name(),
+        "fullscreen": placement.fullscreen,
+        "maximized": placement.maximized,
+    }))
+}
+
+#[tauri::command]
+fn window_move_to_secondary(window: Window) -> Result<serde_json::Value, String> {
+    let monitors = window.available_monitors().map_err(|error| error.to_string())?;
+    if monitors.len() < 2 {
+        return Ok(serde_json::json!({ "ok": false, "error": "secondary_monitor_not_found" }));
+    }
+
+    let primary_name = window
+        .primary_monitor()
+        .map_err(|error| error.to_string())?
+        .and_then(|monitor| monitor.name().cloned());
+    let target = monitors
+        .iter()
+        .find(|monitor| monitor.name() != primary_name.as_ref())
+        .unwrap_or(&monitors[1]);
+
+    window.set_fullscreen(false).map_err(|error| error.to_string())?;
+    window.unmaximize().map_err(|error| error.to_string())?;
+    window
+        .set_position(Position::Physical(*target.position()))
+        .map_err(|error| error.to_string())?;
+    window
+        .set_size(Size::Physical(*target.size()))
+        .map_err(|error| error.to_string())?;
+    let placement = WindowPlacement {
+        x: target.position().x,
+        y: target.position().y,
+        width: target.size().width,
+        height: target.size().height,
+        maximized: false,
+        fullscreen: true,
+        monitor_name: target.name().cloned(),
+    };
+    write_window_placement(&window, &placement)?;
+    window.set_fullscreen(true).map_err(|error| error.to_string())?;
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "monitor": target.name(),
+        "fullscreen": placement.fullscreen,
+    }))
+}
+
+#[tauri::command]
+fn window_toggle_fullscreen(window: Window) -> Result<serde_json::Value, String> {
+    let fullscreen = window.is_fullscreen().map_err(|error| error.to_string())?;
+    window.set_fullscreen(!fullscreen).map_err(|error| error.to_string())?;
+    let placement = persist_window_placement(&window)?;
+    Ok(serde_json::json!({ "ok": true, "fullscreen": placement.fullscreen }))
+}
+
+#[tauri::command]
+async fn open_ostranauts_companion(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    if let Some(companion) = app.get_webview_window("ostranauts-companion") {
+        let monitors = companion.available_monitors().map_err(|error| error.to_string())?;
+        let primary_name = companion
+            .primary_monitor()
+            .map_err(|error| error.to_string())?
+            .and_then(|monitor| monitor.name().cloned());
+        let target = monitors
+            .iter()
+            .find(|monitor| monitor.name() != primary_name.as_ref())
+            .ok_or("secondary_monitor_not_found")?;
+
+        companion.set_fullscreen(false).map_err(|error| error.to_string())?;
+        companion
+            .set_position(Position::Physical(*target.position()))
+            .map_err(|error| error.to_string())?;
+        companion
+            .set_size(Size::Physical(*target.size()))
+            .map_err(|error| error.to_string())?;
+        companion.set_fullscreen(true).map_err(|error| error.to_string())?;
+        companion.show().map_err(|error| error.to_string())?;
+        companion.set_focus().map_err(|error| error.to_string())?;
+        if let Some(main) = app.get_webview_window("main") {
+            main.hide().map_err(|error| error.to_string())?;
+        }
+        return Ok(serde_json::json!({ "ok": true, "created": false }));
+    }
+
+    let companion = WebviewWindowBuilder::new(
+        &app,
+        "ostranauts-companion",
+        WebviewUrl::App("index.html?view=ostranauts".into()),
+    )
+    .title("Mina // Ostranauts Companion")
+    .inner_size(1280.0, 720.0)
+    .min_inner_size(800.0, 600.0)
+    .decorations(false)
+    .visible(false)
+    .build()
+    .map_err(|error| error.to_string())?;
+
+    let app_on_destroy = app.clone();
+    companion.on_window_event(move |event| {
+        if matches!(event, tauri::WindowEvent::Destroyed) {
+            if let Some(main) = app_on_destroy.get_webview_window("main") {
+                let _ = main.show();
+                let _ = main.set_focus();
+            }
+        }
+    });
+
+    let monitors = companion.available_monitors().map_err(|error| error.to_string())?;
+    let primary_name = companion
+        .primary_monitor()
+        .map_err(|error| error.to_string())?
+        .and_then(|monitor| monitor.name().cloned());
+    let target = monitors
+        .iter()
+        .find(|monitor| monitor.name() != primary_name.as_ref())
+        .ok_or("secondary_monitor_not_found")?;
+
+    companion
+        .set_position(Position::Physical(*target.position()))
+        .map_err(|error| error.to_string())?;
+    companion
+        .set_size(Size::Physical(*target.size()))
+        .map_err(|error| error.to_string())?;
+    companion.set_fullscreen(true).map_err(|error| error.to_string())?;
+    companion.show().map_err(|error| error.to_string())?;
+    companion.set_focus().map_err(|error| error.to_string())?;
+
+    if let Some(main) = app.get_webview_window("main") {
+        main.hide().map_err(|error| error.to_string())?;
+    }
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "created": true,
+        "monitor": target.name(),
+        "x": target.position().x,
+        "y": target.position().y,
+        "width": target.size().width,
+        "height": target.size().height,
+    }))
+}
+
+#[tauri::command]
+fn close_ostranauts_companion(window: WebviewWindow, app: tauri::AppHandle) -> Result<(), String> {
+    if window.label() != "ostranauts-companion" {
+        return Err("not_companion_window".to_string());
+    }
+
+    if let Some(main) = app.get_webview_window("main") {
+        main.show().map_err(|error| error.to_string())?;
+        main.set_focus().map_err(|error| error.to_string())?;
+    }
+    window.close().map_err(|error| error.to_string())
 }
 
 fn push_voice_log(line: String) {
@@ -967,7 +1272,13 @@ pub fn run() {
             service_stop_api_local,
             service_start_voice_loop_local,
             service_stop_voice_loop_local,
-            service_voice_loop_status
+            service_voice_loop_status,
+            window_save_placement,
+            window_restore_placement,
+            window_move_to_secondary,
+            window_toggle_fullscreen,
+            open_ostranauts_companion,
+            close_ostranauts_companion
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

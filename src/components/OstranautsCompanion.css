@@ -1,0 +1,447 @@
+@import url("https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=Share+Tech+Mono&display=swap");
+
+.ost-root {
+    --void: #070706;
+    --iron: #111311;
+    --panel: #171b18;
+    --line: #3c4a42;
+    --mint: #92d5b0;
+    --amber: #e6a84a;
+    --paper: #d9d5c5;
+    --danger: #d25c4b;
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+    color: var(--paper);
+    background-color: var(--void);
+    background-image:
+        linear-gradient(rgba(146, 213, 176, 0.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(146, 213, 176, 0.035) 1px, transparent 1px),
+        radial-gradient(circle at 18% 32%, #263129 0, #0b0d0b 38%, #050505 72%);
+    background-size: 38px 38px, 38px 38px, auto;
+    font-family: "Chakra Petch", sans-serif;
+    letter-spacing: 0;
+}
+
+.ost-header {
+    height: 78px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 18px;
+    border-bottom: 1px solid var(--line);
+    background: rgba(7, 7, 6, 0.94);
+}
+
+.ost-kicker,
+.ost-section-label,
+.ost-ident small,
+.ost-path {
+    font-family: "Share Tech Mono", monospace;
+}
+
+.ost-kicker {
+    display: block;
+    color: var(--amber);
+    font-size: 11px;
+}
+
+.ost-wordmark h1 {
+    margin: 2px 0 0;
+    color: var(--paper);
+    font-size: 25px;
+    line-height: 1;
+    font-weight: 600;
+}
+
+.ost-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.ost-link-state,
+.ost-exit {
+    min-height: 34px;
+    border: 1px solid var(--danger);
+    padding: 7px 10px;
+    color: #f1c1b9;
+    background: #27110e;
+    font: 600 11px "Share Tech Mono", monospace;
+}
+
+.ost-exit {
+    cursor: pointer;
+    color: var(--paper);
+    border-color: #696b60;
+    background: #1b1d19;
+}
+
+.ost-exit:hover {
+    border-color: var(--amber);
+    color: var(--amber);
+}
+
+.ost-link-state.is-online {
+    border-color: #4b8f69;
+    color: #b7f0ce;
+    background: #11271a;
+}
+
+.ost-workspace {
+    height: calc(100vh - 78px);
+    display: grid;
+    grid-template-columns: minmax(220px, 0.72fr) minmax(420px, 1.65fr) minmax(250px, 0.85fr);
+    min-height: 0;
+}
+
+.ost-mina-bay,
+.ost-conversation,
+.ost-telemetry {
+    min-width: 0;
+    min-height: 0;
+    border-right: 1px solid var(--line);
+    background: rgba(17, 19, 17, 0.87);
+}
+
+.ost-mina-bay {
+    display: grid;
+    grid-template-rows: minmax(240px, 1fr) auto 180px;
+}
+
+.ost-avatar-frame {
+    position: relative;
+    overflow: hidden;
+    border-bottom: 1px solid var(--line);
+    background: #09100b;
+}
+
+.ost-avatar-frame img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    filter: sepia(0.18) saturate(0.82) contrast(1.08) drop-shadow(0 0 14px rgba(146, 213, 176, 0.34));
+}
+
+.ost-scanline {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: repeating-linear-gradient(0deg, transparent 0 3px, rgba(0, 0, 0, 0.22) 4px);
+}
+
+.ost-ident {
+    padding: 12px 14px;
+    display: grid;
+    grid-template-columns: 1fr auto;
+    border-bottom: 1px solid var(--line);
+}
+
+.ost-ident span {
+    color: var(--amber);
+    font-size: 11px;
+}
+
+.ost-ident strong {
+    grid-row: span 2;
+    font-size: 28px;
+    color: var(--mint);
+}
+
+.ost-ident small {
+    color: #86948a;
+    font-size: 10px;
+}
+
+.ost-orbit-display {
+    position: relative;
+    overflow: hidden;
+    background-color: #080b09;
+    background-image: radial-gradient(circle, rgba(146, 213, 176, 0.18) 1px, transparent 1px);
+    background-size: 14px 14px;
+}
+
+.ost-orbit,
+.ost-orbit-core,
+.ost-sweep {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    border-radius: 50%;
+}
+
+.ost-orbit {
+    border: 1px solid rgba(146, 213, 176, 0.35);
+}
+
+.ost-orbit-one {
+    width: 105px;
+    height: 105px;
+}
+
+.ost-orbit-two {
+    width: 160px;
+    height: 160px;
+}
+
+.ost-orbit-core {
+    width: 9px;
+    height: 9px;
+    background: var(--amber);
+    box-shadow: 0 0 12px var(--amber);
+}
+
+.ost-sweep {
+    width: 150px;
+    height: 1px;
+    transform-origin: left center;
+    background: linear-gradient(90deg, var(--mint), transparent);
+    animation: ost-scan 5s linear infinite;
+}
+
+@keyframes ost-scan {
+    from {
+        transform: rotate(0deg);
+    }
+
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.ost-conversation {
+    display: grid;
+    grid-template-rows: auto 1fr auto auto;
+    background: rgba(8, 10, 9, 0.93);
+}
+
+.ost-section-label {
+    min-height: 32px;
+    padding: 8px 12px;
+    color: var(--amber);
+    border-bottom: 1px solid var(--line);
+    font-size: 11px;
+}
+
+.ost-log {
+    min-height: 0;
+    overflow-y: auto;
+    padding: 15px;
+}
+
+.ost-message {
+    display: grid;
+    grid-template-columns: 68px 1fr;
+    gap: 10px;
+    margin-bottom: 16px;
+}
+
+.ost-message span {
+    color: #768279;
+    font: 11px "Share Tech Mono", monospace;
+}
+
+.ost-message p {
+    margin: 0;
+    white-space: pre-wrap;
+    line-height: 1.45;
+    font-size: 14px;
+}
+
+.ost-message.is-mina p {
+    color: #c8efd8;
+}
+
+.ost-message.is-travis p {
+    color: #f1d29c;
+}
+
+.ost-message.is-system p {
+    color: #ef9c90;
+}
+
+.ost-quick-row {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    border-top: 1px solid var(--line);
+}
+
+.ost-quick-row button,
+.ost-input-row button {
+    min-height: 38px;
+    border: 0;
+    border-right: 1px solid var(--line);
+    color: var(--mint);
+    background: #111712;
+    font: 500 11px "Chakra Petch", sans-serif;
+    cursor: pointer;
+}
+
+.ost-quick-row button:hover,
+.ost-input-row button:hover {
+    background: #1a281e;
+}
+
+.ost-quick-row button:disabled,
+.ost-input-row button:disabled {
+    opacity: 0.45;
+    cursor: default;
+}
+
+.ost-input-row {
+    display: grid;
+    grid-template-columns: 1fr 110px;
+    border-top: 1px solid var(--line);
+}
+
+.ost-input-row textarea {
+    min-height: 72px;
+    max-height: 110px;
+    resize: none;
+    border: 0;
+    padding: 13px;
+    outline: none;
+    color: var(--paper);
+    background: #080a09;
+    font: 14px "Share Tech Mono", monospace;
+}
+
+.ost-input-row button {
+    border-left: 1px solid var(--amber);
+    color: #171007;
+    background: var(--amber);
+}
+
+.ost-telemetry {
+    border-right: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+.ost-telemetry dl {
+    margin: 0;
+    padding: 10px 12px;
+}
+
+.ost-telemetry dl div {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 8px;
+    padding: 8px 0;
+    border-bottom: 1px solid #282f2a;
+}
+
+.ost-telemetry dt {
+    color: #748078;
+    font-size: 10px;
+}
+
+.ost-telemetry dd {
+    margin: 0;
+    color: var(--paper);
+    font: 12px "Share Tech Mono", monospace;
+    text-align: right;
+    overflow-wrap: anywhere;
+}
+
+.ost-telemetry dd.is-good {
+    color: var(--mint);
+}
+
+.ost-telemetry dd.is-warn {
+    color: var(--danger);
+}
+
+.ost-capabilities {
+    padding: 12px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.ost-capabilities>span {
+    width: 100%;
+    color: var(--amber);
+    font-size: 10px;
+}
+
+.ost-capabilities b,
+.ost-capabilities em {
+    border: 1px solid #435c4b;
+    padding: 4px 6px;
+    color: #9dc7ad;
+    background: #101712;
+    font: normal 10px "Share Tech Mono", monospace;
+}
+
+.ost-capabilities em {
+    color: #826e69;
+    border-color: #573e39;
+}
+
+.ost-path {
+    margin-top: auto;
+    padding: 10px 12px;
+    border-top: 1px solid var(--line);
+    color: #778078;
+    font-size: 9px;
+    overflow-wrap: anywhere;
+}
+
+@media (max-width: 900px) {
+    .ost-workspace {
+        grid-template-columns: 190px minmax(360px, 1fr);
+    }
+
+    .ost-telemetry {
+        display: none;
+    }
+}
+
+@media (max-width: 640px) {
+    .ost-header {
+        height: 68px;
+        padding: 8px 10px;
+    }
+
+    .ost-wordmark h1 {
+        font-size: 18px;
+    }
+
+    .ost-link-state {
+        display: none;
+    }
+
+    .ost-display-note,
+    .ost-display-action {
+        display: none;
+    }
+
+    .ost-workspace {
+        height: calc(100vh - 68px);
+        display: block;
+    }
+
+    .ost-mina-bay {
+        display: none;
+    }
+
+    .ost-conversation {
+        height: 100%;
+    }
+
+    .ost-quick-row {
+        grid-template-columns: 1fr;
+    }
+
+    .ost-quick-row button {
+        min-height: 34px;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .ost-sweep {
+        animation: none;
+    }
+}

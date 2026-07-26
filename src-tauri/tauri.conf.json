@@ -15,9 +15,9 @@
         "title": "Mk1 Command Interface v.7",
         "width": 1860,
         "height": 1020,
-        "minWidth": 1360,
-        "minHeight": 820,
-		"devtools": true
+        "minWidth": 800,
+        "minHeight": 600,
+        "devtools": true
       }
     ],
     "security": {
